@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+scripts
+README.md
+LICENSE
+VERSION
+.gitignore
+.gitattributes

@@ -1,0 +1,115 @@
+name: Update Upstream Version
+
+on:
+  schedule:
+    - cron: "51 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    name: Discover new versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      versions: ${{ steps.discover.outputs.versions }}
+      latest: ${{ steps.discover.outputs.latest }}
+      has_updates: ${{ steps.discover.outputs.has_updates }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - id: discover
+        shell: bash
+        run: |
+          versions="$(node scripts/update-version.mjs --list-newer)"
+          latest="$(node -e 'const versions = JSON.parse(process.argv[1]); console.log(versions.at(-1) ?? "")' "$versions")"
+          {
+            echo "versions=$versions"
+            echo "latest=$latest"
+            if [ "$versions" = "[]" ]; then
+              echo "has_updates=false"
+            else
+              echo "has_updates=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test v${{ matrix.upstream_version }}
+    needs: discover
+    if: needs.discover.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream_version: ${{ fromJson(needs.discover.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Retarget to ${{ matrix.upstream_version }}
+        run: node scripts/update-version.mjs --version "${{ matrix.upstream_version }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: container-db-backup-doppler:test
+          build-args: |
+            DB_BACKUP_VERSION=${{ matrix.upstream_version }}
+
+      - name: Verify doppler CLI
+        run: docker run --rm --entrypoint doppler container-db-backup-doppler:test --version
+
+  pull-request:
+    name: Open update PR
+    needs:
+      - discover
+      - test
+    if: always() && needs.discover.outputs.has_updates == 'true' && needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - run: node scripts/update-version.mjs --version "${{ needs.discover.outputs.latest }}"
+
+      - id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/update-db-backup-${{ needs.discover.outputs.latest }}
+          delete-branch: true
+          title: "chore: target db-backup ${{ needs.discover.outputs.latest }}"
+          commit-message: "chore: target db-backup ${{ needs.discover.outputs.latest }}"
+          body: |
+            Updates the default `db-backup` version to `${{ needs.discover.outputs.latest }}`.
+
+            The updater tested every newly discovered version before opening this PR:
+
+            ```json
+            ${{ needs.discover.outputs.versions }}
+            ```
+
+      - name: Enable auto-merge
+        if: steps.create-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge "${{ steps.create-pr.outputs.pull-request-number }}" --auto --squash
+        continue-on-error: true
